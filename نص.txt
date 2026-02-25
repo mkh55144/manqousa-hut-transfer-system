@@ -1,6 +1,250 @@
-fastapi
-uvicorn
-pandas
-openpyxl
-passlib[bcrypt]
-python-multipart
+from fastapi import FastAPI, Request, Form, Depends, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from passlib.hash import bcrypt
+import sqlite3
+import pandas as pd
+from datetime import datetime
+
+app = FastAPI(title="منقوشة هت — نظام إدارة التحويلات")
+
+DB = "data.db"
+security = HTTPBasic()
+
+# =========================
+# Database Init
+# =========================
+def init_db():
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+
+    # users
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        username TEXT PRIMARY KEY,
+        password TEXT,
+        role TEXT,
+        branch TEXT
+    )
+    """)
+
+    # items
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS items(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_code TEXT,
+        item_name TEXT,
+        unit TEXT
+    )
+    """)
+
+    # transfers
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS transfers(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_code TEXT,
+        item_name TEXT,
+        from_branch TEXT,
+        to_branch TEXT,
+        qty REAL,
+        note TEXT,
+        date TEXT,
+        received INTEGER DEFAULT 0
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# =========================
+# Seed Users
+# =========================
+def seed_users():
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+
+    users = [
+        ("1", "102030", "admin", "ADMIN"),
+        ("102", "123456", "operator", "المطبخ"),
+        ("103", "123456", "operator", "المستودع"),
+        ("201", "123456", "operator", "الفيصلية"),
+        ("203", "123456", "operator", "النسيم"),
+        ("204", "123456", "operator", "النهضة"),
+        ("205", "123456", "operator", "المروة"),
+        ("206", "123456", "operator", "ابحر"),
+    ]
+
+    for u in users:
+        cur.execute("SELECT username FROM users WHERE username=?", (u[0],))
+        if not cur.fetchone():
+            cur.execute(
+                "INSERT INTO users VALUES (?,?,?,?)",
+                (u[0], bcrypt.hash(u[1]), u[2], u[3])
+            )
+
+    conn.commit()
+    conn.close()
+
+seed_users()
+
+# =========================
+# Auth
+# =========================
+def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE username=?", (credentials.username,))
+    user = cur.fetchone()
+    conn.close()
+
+    if not user or not bcrypt.verify(credentials.password, user[1]):
+        raise HTTPException(status_code=401, detail="بيانات الدخول غير صحيحة")
+
+    return {
+        "username": user[0],
+        "role": user[2],
+        "branch": user[3]
+    }
+
+# =========================
+# Home
+# =========================
+@app.get("/", response_class=HTMLResponse)
+def home(user=Depends(get_current_user)):
+    if user["role"] == "admin":
+        return RedirectResponse("/admin")
+    return RedirectResponse("/operator")
+
+# =========================
+# Admin Panel
+# =========================
+@app.get("/admin", response_class=HTMLResponse)
+def admin_panel(user=Depends(get_current_user)):
+    if user["role"] != "admin":
+        return "غير مصرح"
+
+    return """
+    <h2>لوحة الأدمن — منقوشة هت</h2>
+    <a href='/items'>بيانات الأصناف</a><br><br>
+    <a href='/report'>التقارير</a>
+    """
+
+# =========================
+# Items Screen
+# =========================
+@app.get("/items", response_class=HTMLResponse)
+def items_screen(user=Depends(get_current_user)):
+    if user["role"] != "admin":
+        return "غير مصرح"
+
+    conn = sqlite3.connect(DB)
+    df = pd.read_sql_query("SELECT * FROM items", conn)
+    conn.close()
+
+    rows = ""
+    for _, r in df.iterrows():
+        rows += f"<tr><td>{r['item_code']}</td><td>{r['item_name']}</td><td>{r['unit']}</td></tr>"
+
+    return f"""
+    <h2>بيانات الأصناف</h2>
+    <form method='post'>
+    رقم الصنف <input name='code'><br>
+    اسم الصنف <input name='name'><br>
+    الوحدة <input name='unit'><br>
+    <button type='submit'>إضافة</button>
+    </form>
+    <table border=1>
+    <tr><th>الكود</th><th>الاسم</th><th>الوحدة</th></tr>
+    {rows}
+    </table>
+    """
+
+@app.post("/items")
+async def add_item(
+    code: str = Form(...),
+    name: str = Form(...),
+    unit: str = Form(...),
+    user=Depends(get_current_user)
+):
+    if user["role"] != "admin":
+        return "غير مصرح"
+
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO items(item_code,item_name,unit) VALUES(?,?,?)",
+        (code, name, unit)
+    )
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/items", status_code=302)
+
+# =========================
+# Operator Screen
+# =========================
+@app.get("/operator", response_class=HTMLResponse)
+def operator_screen(user=Depends(get_current_user)):
+    conn = sqlite3.connect(DB)
+    df = pd.read_sql_query("SELECT * FROM items", conn)
+    conn.close()
+
+    options = "".join(
+        [f"<option value='{r.item_code}|{r.item_name}'>{r.item_name}</option>" for _, r in df.iterrows()]
+    )
+
+    return f"""
+    <h2>تشغيل الفرع — {user['branch']}</h2>
+    <form method='post' action='/transfer'>
+    الصنف:
+    <select name='item'>{options}</select><br>
+    إلى فرع:
+    <input name='to_branch'><br>
+    الكمية:
+    <input name='qty'><br>
+    ملاحظات:
+    <input name='note'><br>
+    <button type='submit'>تنفيذ التحويل</button>
+    </form>
+    """
+
+@app.post("/transfer")
+async def transfer(
+    item: str = Form(...),
+    to_branch: str = Form(...),
+    qty: float = Form(...),
+    note: str = Form(""),
+    user=Depends(get_current_user)
+):
+    code, name = item.split("|")
+
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO transfers(
+        item_code,item_name,from_branch,to_branch,qty,note,date
+    ) VALUES(?,?,?,?,?,?,?)
+    """, (
+        code, name, user["branch"], to_branch, qty, note,
+        datetime.now().strftime("%Y-%m-%d %H:%M")
+    ))
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse("/operator", status_code=302)
+
+# =========================
+# Report
+# =========================
+@app.get("/report")
+def report(user=Depends(get_current_user)):
+    if user["role"] != "admin":
+        return "غير مصرح"
+
+    conn = sqlite3.connect(DB)
+    df = pd.read_sql_query("SELECT * FROM transfers", conn)
+    file = "report.xlsx"
+    df.to_excel(file, index=False)
+    conn.close()
+    return FileResponse(file, filename=file)
